@@ -1,0 +1,331 @@
+---
+title: "dermacentor"
+author: "Jessica Martin, Ilya Fischhoff"
+date: "1/23/2020"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#####install packages
+```{r packages, echo=FALSE}
+pkgTest <- function(x)
+{
+  if (x %in% rownames(installed.packages()) == FALSE) {
+    install.packages(x, dependencies= TRUE)    
+  }
+  library(x, character.only = TRUE)
+}
+neededPackages <- c("gbm", "caTools", "dismo", "caret", "ROCR", "ggplot2")
+
+for (package in neededPackages){pkgTest(package)}
+```
+
+
+###read in data and rearrange columns
+```{r read}
+tick2<-read.csv("Dermacentor database_v2_01-10-20_4R.csv", header = T)
+
+#remove variables with all NAs
+tick <- tick2[, !apply(is.na(tick2),2,all)]
+
+#rearrange columns so that GIDEON (the response variable) is last
+tick<-tick[c(1:91,93:101,92)]
+
+```
+
+#### remove columns with near zero variance Global
+### this reduces the number of variables from 101 to 92
+```{r near zero}
+nzv <- nearZeroVar(tick,saveMetrics=TRUE, freqCut = 80/20)#changed from default 95/5 because otherwise ran into checksum error when doing bootstrap AUC
+nzv <- row.names(nzv[which(nzv$nzv==TRUE),])
+dropnzv<-names(tick[ , which(names(tick) %in% nzv)])
+tick<-tick[ , -which(names(tick) %in% nzv)]
+dim(tick)
+```
+
+### select traits above a coverage threshold
+
+## Ilya - Barbara's orignal comment here said to "update to inlcude the residuals columns"
+## I'm not sure that I did this step right (I'm unclear on what the residuals columns are for)
+## Does this step make sense to you?
+
+```{r}
+index<-c(2:dim(tick)[2]) #comment from Jess: index excludes columns for species.name, does not include residuals (?)
+
+traits<-names(tick)[index]
+output<-c() # trait coverage
+
+for(i in 1:length(traits)){
+  output[i]<-length(tick[which(is.na(tick[,index[i]])==F),index[i]])/length(tick[,index[i]])
+}
+coverage<-data.frame(cbind(traits,output),stringsAsFactors = FALSE)
+colnames(coverage)<-c("Predictor","Coverage")
+
+# set coverage threshold
+#JM: changed threshold from 0.01 to 0.1
+traits<-coverage[which(coverage$Coverage > 0.1),]  
+
+
+```
+
+
+##run GBM
+```{r gbm}
+shrinkage = 0.0001
+n.trees = 80000
+interaction.depth = 3
+n.minobsinnode = 2
+cv.folds = 2
+
+#Start the clock
+ptm<-proc.time()
+
+set.seed(777)
+intrain<-createDataPartition(y=tick$GIDEON,
+                             # groups=3,
+                             p=0.7,
+                             list=FALSE)
+train<-tick[intrain,]
+test<-tick[-intrain,]
+
+
+# column 94 (GIDEON) contains the outcomes that the model is trying to predict
+y_col = which(names(tick)=="GIDEON")
+model<-as.formula(paste(colnames(tick)[y_col], "~",
+                        paste(traits$Predictor,collapse = "+"), #traits
+                        collapse="+"))
+save(model, file = "model.Rdata")
+tickgbm <- gbm(model,
+               data=train, 
+               distribution="bernoulli", 
+               n.trees=n.trees, 
+               shrinkage=shrinkage,
+               interaction.depth=interaction.depth,
+               bag.fraction=0.50,
+               train.fraction=1,
+               n.minobsinnode=n.minobsinnode,#too few data for 3
+               cv.folds=cv.folds,#too few data for cv.folds = 5
+               class.stratify.cv = TRUE,
+               keep.data=TRUE,
+               verbose=TRUE,
+               n.cores=1)
+
+#check performance
+best.iter <- gbm.perf(tickgbm,method="cv",plot.it=TRUE) #this gives you the optimal number of trees based on cv performance, other methods will over or under predict
+print(best.iter)
+
+gbmsum<-summary(tickgbm, n.trees=best.iter, method=relative.influence)
+gbmsum
+
+# # predictions on the TRAINING SET
+output<-predict(tickgbm, newdata=train, n.trees=best.iter, type="response") 
+output<-cbind(output,as.numeric(train$GIDEON))
+colnames(output)<-c("output","label")
+output<-output[order(-as.numeric(output[,1])),]
+plot(output)
+
+# # training AUC for Bernoulli distributed responses
+auc=colAUC(output[,1],output[,2])
+print(auc)
+pred<-prediction(output[,1],output[,2])
+perf<-performance(pred,"tpr","fpr")
+plot(perf,colorize=TRUE,main="ROC full model")
+
+# Predictions on the TEST set
+output.test<-predict(tickgbm, newdata=test, n.trees=best.iter, type="response") 
+output.test<-cbind(output.test,as.numeric(test$GIDEON))
+colnames(output.test)<-c("output","label")
+output.test<-output.test[order(-output.test[,1]),]
+plot(output.test)
+
+## test AUC for Bernoulli distributed responses
+auctest=colAUC(output.test[,1],output.test[,2])
+print(auctest)
+predtest<-prediction(output.test[,1],output.test[,2])
+perftest<-performance(predtest,"tpr","fpr")
+plot(perftest,colorize=TRUE,main="ROC full model",add=T)
+
+#save gbm model output
+save(tickgbm, file = "tickgbm.Rdata")
+
+#Stop the clock
+(proc.time()-ptm)/60
+
+```
+
+##make plot of relative influence
+```{r}
+load("tickgbm.Rdata")
+ x = summary(tickgbm)
+# 
+ x.df= data.frame(variable = x$var,
+                  relative.influence = x$rel.inf)
+x.df$variable=as.character(x.df$variable)
+
+x.df = subset(x.df, relative.influence >= 1)
+x.df$variable = factor(x.df$variable, levels = x.df$variable[order(x.df$relative.influence)])
+save(x.df, file = "x.df.Rdata")
+plot = ggplot(data = x.df, aes(x = variable, y =relative.influence))+
+  ylab("relative influence (%)")+
+  xlab("variable")+
+  geom_bar(stat="identity")+
+  coord_flip()
+# 
+ggsave(plot = plot, filename = "Figure.relative.influence.jpg")
+
+
+```
+
+##Bootstrap permutations for null distribution of AUC -- presence/absence
+```{r boot_null_AUC}
+  # set.seed(Sys.time())#i think we need to reset seed
+
+p = 25#number of bootstrap permutations
+# p = 1#number of bootstrap permutations
+# save(p, file = "p.Rdata")
+df = tick
+rm = "species.name"#remove this field
+keep = setdiff(names(df), rm)
+df = df[,keep]
+#Start the clock
+ptm<-proc.time()
+
+permutedAUC<-c()
+best.iter2.list = c()
+bootstrap_runs = p
+i=1
+while (i <= bootstrap_runs) {
+  # for permutation loop
+  ## random permutation of Label
+  randomLabel<-sample(df$GIDEON)
+
+  pan2<-cbind(randomLabel,df)
+  #remove previous label
+  rm = "GIDEON"
+  keep = setdiff(names(pan2),rm)
+  pan2 = pan2[,keep]
+
+  pan2[,1]<-sapply(pan2[,1],as.character)
+
+  ## create training and test sets
+  intrain2<-createDataPartition(y=pan2$randomLabel,
+                                p=0.7,
+                                list=FALSE)
+
+  test2<-pan2[-intrain2,]
+  training2<-pan2[intrain2,]
+
+  check<-1-is.na(training2)*1
+  checksum<-apply(check,2,sum)
+  n_cols= dim(training2)[2]
+
+  
+  if(length(which(checksum>=2))==n_cols){#this makes sure we don't get any columns with all zeros. Should be == to the number of columns
+
+    ## random permutation of Labels ~ traits
+    y_col = 1#first column is randomLabel
+    x_col = c(2:dim(pan2)[2])
+
+    model<-as.formula(paste(colnames(pan2)[y_col], "~",
+                            paste(colnames(pan2)[x_col],collapse = "+"),
+                            sep = ""))
+
+
+     gbm2<- gbm(model,
+                   data=training2,
+                   distribution="bernoulli",
+                   n.trees=n.trees,
+                   shrinkage=shrinkage,
+                   interaction.depth=interaction.depth,
+                   bag.fraction=0.50,
+                   train.fraction=1,
+                   n.minobsinnode=n.minobsinnode,
+                   cv.folds=cv.folds,
+                   keep.data=TRUE)
+
+    #check performance using 5-fold cross-validation
+    best.iter2 <- gbm.perf(gbm2,method="cv",plot.it=FALSE) #OOB method under predicts
+    #   batsum2<-summary.gbm(gbm2,n.trees=best.iter,method=relative.influence,plotit=FALSE)
+    best.iter2.list = c(best.iter2.list, best.iter2)
+    ## LABEL
+    ## predictions on the TRAINING SET
+    output2<-predict(gbm2, newdata=training2, n.trees=best.iter2, type="response")
+    output2<-cbind(output2,as.numeric(training2$randomLabel))
+
+    # # training AUC for Bernoulli distributed responses
+    auc2=colAUC(output2[,1],output2[,2])
+
+    # Predictions on the TEST set
+    output.test2<-predict(gbm2, newdata=test2, n.trees=best.iter2, type="response")
+    output.test2<-cbind(output.test2,as.numeric(test2$randomLabel))
+    # colnames(output.test2)<-c("output","label")
+    # output.test2<-output.test2[order(-output.test2[,1]),]
+    # plot(output.test)
+
+    ## test AUC for Bernoulli distributed responses
+    auctest2=colAUC(output.test2[,1],output.test2[,2])
+
+    permutedAUC[i]<-auctest2
+    print(auctest2)
+    i=i+1
+    print(i)#check where we are in bootstrap
+  } else i=i
+}
+save(best.iter2.list, file = "best.iter2.list.presence.null.Rdata")
+sum(is.na(permutedAUC)*1) #how many NAs
+permutedAUC2<-na.omit(permutedAUC)
+mean(permutedAUC2)
+mean_AUC_presence_null = mean(permutedAUC2)
+save(mean_AUC_presence_null, file= "mean_AUC_presence_null.Rdata")
+load("mean_AUC_presence_null.Rdata")
+sd(permutedAUC2)
+
+#Stop the clock
+(proc.time()-ptm)/60
+
+
+```
+
+##STOP HERE
+```{r}
+###### stop here for now ######
+
+
+# predictions for all ticks
+combined<-rbind(train,test)
+output.comb<-predict(tickgbm, newdata=combined, n.trees=best.iter, type="response") 
+output.comb<-cbind(output.comb,as.numeric(combined$GIDEON))
+colnames(output.comb)<-c("output","label")
+rownames(output.comb)<-combined$Species.name
+output.comb<-output.comb[order(-output.comb[,1]),]
+
+# testing hypotheses from data-mining
+# need to update variable names
+#1. do larvae with shorter tarsus I have greater host diversity (generalists)? YES
+# plot(tick$L.Tarsus.I,tick$X.of.orders, 
+#      xlab="Tarsus I length larvae", 
+#      ylab="Orders infested")
+# summary(lm(tick$L.Tarsus.I~tick$X.of.orders))
+
+#2. are larvae with shorter tarsus I than expected for their body size the ones 
+## who are generalists?
+# plot(tick$residL.T.1,tick$X.of.orders, 
+#      xlab="resid Tarsus I length", 
+#      ylab="Orders infested")
+# summary(lm(tick$L.Tarsus.I~tick$X.of.orders))
+
+#3. produce a 2-panel figure that shows that the tick species that have shorter tarsus I lengths
+# (for their body size; residual values below zero) also infest the greatest diversity of host species (# Orders)
+# to do this, construct a dataframe of cols: species name, residual L.Tarsus.1, X.of.orders
+# hyp3<-tick[,c(1,2,74,60)]
+```
+
+
+
+
+
+
+
