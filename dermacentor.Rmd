@@ -68,7 +68,8 @@ colnames(coverage)<-c("Predictor","Coverage")
 #JM: changed threshold from 0.01 to 0.1
 traits<-coverage[which(coverage$Coverage > 0.1),]  
 
-
+#remove GIDEON
+traits = subset(traits, Predictor != "GIDEON")
 ```
 
 
@@ -78,7 +79,7 @@ shrinkage = 0.0001
 n.trees = 80000
 interaction.depth = 3
 n.minobsinnode = 2
-cv.folds = 2
+cv.folds = 4
 
 #Start the clock
 ptm<-proc.time()
@@ -183,7 +184,7 @@ ggsave(plot = plot, filename = "Figure.relative.influence.jpg")
 ```{r boot_null_AUC}
   # set.seed(Sys.time())#i think we need to reset seed
 
-p = 25#number of bootstrap permutations
+p = 5#number of bootstrap permutations
 # p = 1#number of bootstrap permutations
 # save(p, file = "p.Rdata")
 df = tick
